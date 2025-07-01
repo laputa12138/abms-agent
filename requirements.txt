@@ -1,0 +1,29 @@
+# Core Xinference client for interacting with LLM, Embedding, Reranker models
+xinference>=0.9.0 # Specify a version or range if known, otherwise latest
+
+# PDF processing
+pypdf2>=3.0.0 # For PDF text extraction
+
+# DOCX processing
+python-docx>=1.1.0 # For DOCX text extraction
+
+# TXT files are handled by built-in Python io operations.
+
+# Keyword-based search (BM25)
+rank_bm25>=0.2.2 # For BM25 ranking algorithm
+
+# Natural Language Toolkit (for sentence tokenization, etc.)
+nltk>=3.8.0 # For sentence tokenization in parent-child chunking
+
+# Vector store and numerical operations
+faiss-cpu>=1.7.0 # For local vector similarity search (CPU version)
+numpy>=1.20.0 # Required by FAISS and for numerical operations
+
+# Optional, but good for managing settings via .env files
+# python-dotenv
+
+# Optional, for more complex configuration file formats if needed in future
+# PyYAML
+
+# Note: Ensure that the Python version used is compatible with these libraries.
+# Typically Python 3.8+ is recommended.
