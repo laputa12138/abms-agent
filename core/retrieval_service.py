@@ -86,41 +86,44 @@ class RetrievalService:
                  query_text: str,
                  vector_top_k: int,
                  keyword_top_k: int,
-                 hybrid_alpha: float, # 0 for keyword only, 1 for vector only
+                 # hybrid_alpha: float, # 0 for keyword only, 1 for vector only # Removed
                  final_top_n: Optional[int] = None
                 ) -> List[Dict[str, Any]]:
         """
-        Performs hybrid retrieval and optional reranking.
+        Performs hybrid retrieval (vector + keyword) and mandatory reranking if available.
+        If RerankerService is not available, results from vector and keyword search are combined
+        and returned, potentially without ideal ordering.
 
         Args:
             query_text (str): The user's query.
-            vector_top_k (int): Number of results from vector search.
-            keyword_top_k (int): Number of results from keyword search.
-            hybrid_alpha (float): Weight for blending vector and keyword scores.
-            final_top_n (Optional[int]): Number of final results to return after all steps.
-                                         If None, returns all processed results.
+            vector_top_k (int): Number of candidates to retrieve from vector search.
+            keyword_top_k (int): Number of candidates to retrieve from keyword search.
+            final_top_n (Optional[int]): Number of final results to return after reranking (or combination).
+                                         If None, returns all processed results up to a reasonable limit post-reranking.
 
         Returns:
             List[Dict[str, Any]]: A list of result dictionaries, structured for consumption
                                   by agents like ChapterWriterAgent. Each dict should contain:
-                                  'document' (parent_text), 'score' (final_score),
+                                  'document' (parent_text), 'score' (final_score from reranker, or default),
                                   'child_text_preview', 'child_id', 'parent_id', 'source' (retrieval method).
         """
         logger.info(f"RetrievalService called with query: '{query_text[:100]}...' "
-                    f"v_k={vector_top_k}, k_k={keyword_top_k}, alpha={hybrid_alpha}, final_n={final_top_n}")
+                    f"v_k={vector_top_k}, k_k={keyword_top_k}, final_n={final_top_n}")
 
         # --- 1. Vector Search ---
-        vector_results_map: Dict[str, Dict[str, Any]] = {} # child_id -> result_dict_with_scores
-        if hybrid_alpha > 0:
+        vector_results_map: Dict[str, Dict[str, Any]] = {} # child_id -> result_dict (metadata + original score)
+        if vector_top_k > 0:
             try:
                 # VectorStore.search returns List[Dict] with child_id, child_text, parent_id, parent_text, source_document_id, score (distance)
                 raw_vector_hits = self.vector_store.search(query_text=query_text, k=vector_top_k)
-                distances = [hit['score'] for hit in raw_vector_hits]
-                norm_similarity_scores = self._normalize_scores(distances, reverse=True)
-
-                for i, hit in enumerate(raw_vector_hits):
+                # No normalization needed here, primarily collecting candidates.
+                # Store original score for potential future use or debugging, but it's not used for combined ranking.
+                for hit in raw_vector_hits:
                     child_id = hit['child_id']
-                    vector_results_map[child_id] = {**hit, 'vector_score': norm_similarity_scores[i], 'keyword_score': 0.0}
+                    # Ensure 'score' from vector store (distance) is preserved if needed later,
+                    # or transform it if a similarity view is more intuitive (e.g. 1 / (1 + distance))
+                    # For now, just pass the hit, which includes its original score.
+                    vector_results_map[child_id] = {**hit, 'retrieval_method': 'vector'}
                 logger.debug(f"Vector search found {len(vector_results_map)} distinct child chunks.")
             except VectorStoreError as e:
                 logger.error(f"VectorStore search failed during retrieval: {e}")
@@ -129,88 +132,140 @@ class RetrievalService:
 
         # --- 2. Keyword Search (BM25) ---
         keyword_results_map: Dict[str, Dict[str, Any]] = {}
-        if hybrid_alpha < 1.0 and self.bm25_index and self.all_child_chunks_for_bm25_mapping:
+        # Keyword search is always attempted if keyword_top_k > 0 and BM25 index is available
+        if keyword_top_k > 0 and self.bm25_index and self.all_child_chunks_for_bm25_mapping:
             try:
                 tokenized_query = self._tokenize_query(query_text)
                 bm25_doc_scores = self.bm25_index.get_scores(tokenized_query)
 
-                # Get top N indices from BM25 scores. These map to `all_child_chunks_for_bm25_mapping`.
-                # Ensure we don't request more than available.
+                # Get top N indices from BM25 scores.
                 num_bm25_candidates = min(keyword_top_k, len(self.all_child_chunks_for_bm25_mapping))
                 top_bm25_indices = np.argsort(bm25_doc_scores)[::-1][:num_bm25_candidates]
 
-                top_bm25_scores_only = [bm25_doc_scores[i] for i in top_bm25_indices]
-                norm_bm25_scores = self._normalize_scores(top_bm25_scores_only, reverse=False)
+                # No normalization of BM25 scores needed here. Collect candidates.
+                # Store original BM25 score for potential future use or debugging.
+                for doc_idx in top_bm25_indices:
+                    bm25_score = bm25_doc_scores[doc_idx]
+                    if bm25_score <= 1e-6: continue # Skip if score is effectively zero
 
-                for i, doc_idx in enumerate(top_bm25_indices):
-                    if norm_bm25_scores[i] <= 1e-6: continue # Skip if score is effectively zero
-
-                    # child_meta_from_bm25_corpus is like {'child_id': ..., 'child_text': ...}
                     child_meta_from_bm25_corpus = self.all_child_chunks_for_bm25_mapping[doc_idx]
                     child_id = child_meta_from_bm25_corpus['child_id']
 
-                    # Fetch full context (parent_text, etc.) using child_id from the main map
                     full_context = self.child_id_to_full_context_map.get(child_id)
                     if not full_context:
                         logger.warning(f"BM25 found child_id '{child_id}' but it's not in child_id_to_full_context_map. Skipping.")
                         continue
 
-                    keyword_results_map[child_id] = {**full_context, 'vector_score': 0.0, 'keyword_score': norm_bm25_scores[i]}
+                    # Add 'score' (original bm25 score) and 'retrieval_method'
+                    keyword_results_map[child_id] = {**full_context, 'score': bm25_score, 'retrieval_method': 'keyword'}
                 logger.debug(f"Keyword search (BM25) found {len(keyword_results_map)} distinct child chunks with positive scores.")
             except Exception as e:
                 logger.error(f"Keyword search (BM25) failed during retrieval: {e}", exc_info=True)
 
-        # --- 3. Combine and Rank Results ---
-        combined_results: Dict[str, Dict[str, Any]] = {}
-        for child_id, data in vector_results_map.items(): combined_results[child_id] = data
+        # --- 3. Combine candidate results (deduplication) ---
+        candidate_pool: Dict[str, Dict[str, Any]] = {} # child_id -> full_data_dict
+
+        # Add vector results first
+        for child_id, data in vector_results_map.items():
+            candidate_pool[child_id] = data # data already contains 'retrieval_method': 'vector' and original 'score'
+
+        # Add keyword results, potentially updating retrieval_method if also found by vector
         for child_id, data in keyword_results_map.items():
-            if child_id in combined_results: combined_results[child_id]['keyword_score'] = data['keyword_score']
-            else: combined_results[child_id] = data
+            if child_id in candidate_pool:
+                # Already present from vector search, update method to 'hybrid'
+                # The 'score' from vector search is kept (or decide on a rule if scores are very different and both needed)
+                # For now, vector's metadata (including its score) takes precedence if collision.
+                candidate_pool[child_id]['retrieval_method'] = 'hybrid'
+                # Optionally, store keyword_score if needed: candidate_pool[child_id]['keyword_score'] = data['score']
+            else:
+                # New entry from keyword search
+                candidate_pool[child_id] = data # data already contains 'retrieval_method': 'keyword' and original 'score'
 
-        scored_results = []
-        for child_id, data in combined_results.items():
-            final_score = (hybrid_alpha * data['vector_score']) + ((1.0 - hybrid_alpha) * data['keyword_score'])
-            source = "hybrid"
-            if hybrid_alpha == 1.0 and data['vector_score'] > 0: source = "vector"
-            elif hybrid_alpha == 0.0 and data['keyword_score'] > 0: source = "keyword"
-            elif data['vector_score'] == 0 and data['keyword_score'] == 0 : source = "none" # Should not happen if filtered before
+        logger.debug(f"Combined pool has {len(candidate_pool)} unique child chunks before reranking.")
 
-            # Only include if there's some score
-            if final_score > 1e-6 : # Tolerance for float precision
-                 scored_results.append({**data, 'final_score': final_score, 'retrieval_source': source})
+        # Convert candidate_pool to a list for reranking or final processing
+        # The 'score' attribute in candidate_pool items is the original score from their respective methods,
+        # it will be replaced by the reranker's score.
+        candidates_for_reranking_or_final = list(candidate_pool.values())
 
-        scored_results.sort(key=lambda x: x['final_score'], reverse=True)
 
-        # --- 4. Optional Reranking (operates on parent_text) ---
-        results_after_rerank_or_hybrid = scored_results # Default if no reranking
-        if self.reranker_service and scored_results:
-            parents_for_reranking = [res['parent_text'] for res in scored_results]
-            # Keep track of original full data to re-associate
-            original_items_before_rerank = list(scored_results) # shallow copy
+        # --- 4. Reranking (operates on parent_text) ---
+        results_to_format = [] # This list will hold the items to be formatted for output
+
+        if self.reranker_service and candidates_for_reranking_or_final:
             try:
-                reranked_outputs = self.reranker_service.rerank(query=query_text, documents=parents_for_reranking, top_n=final_top_n) # Reranker handles top_n
+                parents_for_reranking = [res['parent_text'] for res in candidates_for_reranking_or_final]
 
-                temp_reranked_list = []
-                for reranked_item_from_service in reranked_outputs:
+                # Reranker service is expected to handle top_n internally if final_top_n is provided to it.
+                # The rerank method should accept query, documents, and an optional top_n.
+                reranked_outputs = self.reranker_service.rerank(
+                    query=query_text,
+                    documents=parents_for_reranking,
+                    top_n=final_top_n # Pass final_top_n to reranker
+                )
+
+                # Re-associate reranked scores and order with original full data
+                for reranked_item_from_service in reranked_outputs: # reranked_outputs is already top_n
                     original_idx = reranked_item_from_service['original_index']
-                    original_full_data = original_items_before_rerank[original_idx]
-                    temp_reranked_list.append({
+                    original_full_data = candidates_for_reranking_or_final[original_idx]
+
+                    # Update score and retrieval_source
+                    results_to_format.append({
                         **original_full_data,
-                        'parent_text': reranked_item_from_service['document'], # This is the parent_text
-                        'final_score': reranked_item_from_service['relevance_score'], # Update score
-                        'retrieval_source': original_full_data['retrieval_source'] + "_reranked"
+                        'final_score': reranked_item_from_service['relevance_score'],
+                        'retrieval_source': original_full_data.get('retrieval_method', 'unknown') + "_reranked"
                     })
-                results_after_rerank_or_hybrid = temp_reranked_list
-                logger.debug(f"Reranking complete. Produced {len(results_after_rerank_or_hybrid)} results.")
+                logger.debug(f"Reranking complete. Produced {len(results_to_format)} results.")
+
             except RerankerServiceError as e:
-                logger.error(f"Reranker service error: {e}. Using pre-reranked results.")
-                # Fallback to results before reranking, respecting final_top_n if reranker was supposed to do it
-                results_after_rerank_or_hybrid = scored_results[:final_top_n] if final_top_n else scored_results
+                logger.error(f"Reranker service error: {e}. Using pre-reranked results with simple truncation.")
+                # Fallback: use combined candidates, sort by some default if desired, or just truncate
+                # For now, no specific sort, just truncate. Reranker was supposed to sort.
+                # Scores will be original retrieval scores which are not comparable across methods.
+                # Assign a default score or handle this explicitly.
+                for item in candidates_for_reranking_or_final:
+                    item['final_score'] = item.get('score', 0.0) # Use original score, or 0.0
+                    item['retrieval_source'] = item.get('retrieval_method', 'unknown') + "_fallback"
+                results_to_format = candidates_for_reranking_or_final
+                if final_top_n is not None:
+                    results_to_format = results_to_format[:final_top_n]
             except Exception as e:
-                 logger.error(f"Unexpected error during reranking: {e}. Using pre-reranked results.", exc_info=True)
-                 results_after_rerank_or_hybrid = scored_results[:final_top_n] if final_top_n else scored_results
-        elif final_top_n is not None: # No reranker, but final_top_n is set
-            results_after_rerank_or_hybrid = scored_results[:final_top_n]
+                logger.error(f"Unexpected error during reranking: {e}. Using pre-reranked results.", exc_info=True)
+                for item in candidates_for_reranking_or_final:
+                    item['final_score'] = item.get('score', 0.0)
+                    item['retrieval_source'] = item.get('retrieval_method', 'unknown') + "_fallback_exception"
+                results_to_format = candidates_for_reranking_or_final
+                if final_top_n is not None:
+                    results_to_format = results_to_format[:final_top_n]
+        else: # No reranker or no candidates
+            logger.info("No reranker service available or no candidates to rerank. Using combined results directly.")
+            # Scores will be original retrieval scores.
+            # For consistency, add 'final_score' and 'retrieval_source'
+            for item in candidates_for_reranking_or_final:
+                item['final_score'] = item.get('score', 0.0) # Use original score (vector distance or bm25 score)
+                item['retrieval_source'] = item.get('retrieval_method', 'unknown')
+            results_to_format = candidates_for_reranking_or_final
+            if final_top_n is not None: # Apply final_top_n if set
+                # If no reranker, there's no inherent sorting order across vector/keyword results with raw scores.
+                # A simple sort might be needed if a consistent top_n is desired without reranking.
+                # However, the problem asks to *use* reranker. If no reranker, it's a fallback.
+                # Let's assume for now, if no reranker, the order is somewhat arbitrary from pool conversion.
+                results_to_format = results_to_format[:final_top_n]
+
+
+        # --- 5. Format for Output ---
+        # Ensure the output format is suitable for ChapterWriterAgent
+        output_for_chapter_writer: List[Dict[str, Any]] = []
+        for res_item in results_to_format: # Iterate over what's decided in step 4
+            output_for_chapter_writer.append({
+                "document": res_item["parent_text"], # Key for ChapterWriterAgent
+                "score": res_item["final_score"], # This is reranked_score or fallback score
+                "child_text_preview": res_item["child_text"][:150] + "...", # For context/logging
+                "child_id": res_item["child_id"],
+                "parent_id": res_item["parent_id"],
+                "source_document_id": res_item["source_document_id"],
+                "retrieval_source": res_item["retrieval_source"] # For tracing
+            })
 
 
         # --- 5. Format for Output ---
@@ -327,10 +382,10 @@ if __name__ == '__main__':
         try:
             results = retrieval_svc.retrieve(
                 query_text=t_query,
-                vector_top_k=2,
-                keyword_top_k=2,
-                hybrid_alpha=0.5,
-                final_top_n=2
+                vector_top_k=2,  # How many candidates from vector search
+                keyword_top_k=2, # How many candidates from keyword search
+                # hybrid_alpha is removed
+                final_top_n=2    # How many results after reranking (or combination if no reranker)
             )
             if results:
                 logger.info(f"Found {len(results)} items for query '{t_query}':")
